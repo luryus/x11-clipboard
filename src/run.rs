@@ -1,4 +1,5 @@
 use std::cmp;
+use std::iter::once;
 use std::sync::Arc;
 use std::sync::mpsc::{ Receiver, TryRecvError };
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ struct IncrState {
     selection: x::Atom,
     requestor: x::Window,
     property: x::Atom,
+    target: x::Atom,
     pos: usize
 }
 
@@ -32,7 +34,7 @@ pub fn run(context: &Arc<Context>, setmap: &SetMap, max_length: usize, receiver:
                 Ok(selection) => if let Some(property) = incr_map.remove(&selection) {
                     state_map.remove(&property);
                 },
-                Err(TryRecvError::Empty) => break(),
+                Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => if state_map.is_empty() {
                     return
                 }
@@ -42,47 +44,64 @@ pub fn run(context: &Arc<Context>, setmap: &SetMap, max_length: usize, receiver:
         match event {
             xcb::Event::X(x::Event::SelectionRequest(event)) => {
                 let read_map = try_continue!(setmap.read().ok());
-                let &(target, ref value) = try_continue!(read_map.get(&event.selection()));
+                let target_values_map = try_continue!(read_map.get(&event.selection()));
 
                 if event.target() == context.atoms.targets {
+                    let all_targets: Vec<_> = target_values_map.keys().copied().chain(once(context.atoms.targets)).collect();
                     context.connection.send_request(&x::ChangeProperty {
                         mode: x::PropMode::Replace,
                         window: event.requestor(),
                         property: event.property(),
                         r#type: x::ATOM_ATOM,
-                        data: &[context.atoms.targets, target],
+                        data: &all_targets,
                     });
-                } else if value.len() < max_length - 24 {
-                    context.connection.send_request(&x::ChangeProperty {
-                        mode: x::PropMode::Replace,
-                        window: event.requestor(),
-                        property: event.property(),
-                        r#type: target,
-                        data: &value,
-                    });
-                } else {
-                    context.connection.send_request(&x::ChangeWindowAttributes {
-                        window: event.requestor(),
-                        value_list: &[x::Cw::EventMask(x::EventMask::PROPERTY_CHANGE)],
-                    });
-                    context.connection.send_request(&x::ChangeProperty {
-                        mode: x::PropMode::Replace,
-                        window: event.requestor(),
-                        property: event.property(),
-                        r#type: context.atoms.incr,
-                        data: &[0u32; 0],
-                    });
-
-                    incr_map.insert(event.selection(), event.property());
-                    state_map.insert(
-                        event.property(),
-                        IncrState {
-                            selection: event.selection(),
-                            requestor: event.requestor(),
+                } else if let Some(value) = target_values_map.get(&event.target()) {
+                    if value.len() < max_length - 24 {
+                        context.connection.send_request(&x::ChangeProperty {
+                            mode: x::PropMode::Replace,
+                            window: event.requestor(),
                             property: event.property(),
-                            pos: 0
-                        }
-                    );
+                            r#type: event.target(),
+                            data: value,
+                        });
+                    } else {
+                        context.connection.send_request(&x::ChangeWindowAttributes {
+                            window: event.requestor(),
+                            value_list: &[x::Cw::EventMask(x::EventMask::PROPERTY_CHANGE)],
+                        });
+                        context.connection.send_request(&x::ChangeProperty {
+                            mode: x::PropMode::Replace,
+                            window: event.requestor(),
+                            property: event.property(),
+                            r#type: context.atoms.incr,
+                            data: &[0u32; 0],
+                        });
+
+                        incr_map.insert(event.selection(), event.property());
+                        state_map.insert(
+                            event.property(),
+                            IncrState {
+                                selection: event.selection(),
+                                requestor: event.requestor(),
+                                property: event.property(),
+                                target: event.target(),
+                                pos: 0
+                            }
+                        );
+                    }
+                } else {
+                    // Unsupported target type. Return "none"
+                    context.connection.send_request(&x::SendEvent {
+                        propagate: false,
+                        destination: x::SendEventDest::Window(event.requestor()),
+                        event_mask: x::EventMask::empty(),
+                        event: &x::SelectionNotifyEvent::new(
+                            event.time(), event.requestor(), event.selection(),
+                            event.target(), x::ATOM_NONE
+                        )
+                    });
+                    let _ = context.connection.flush();
+                    continue;
                 }
 
                 context.connection.send_request(&x::SendEvent {
@@ -101,14 +120,15 @@ pub fn run(context: &Arc<Context>, setmap: &SetMap, max_length: usize, receiver:
                 let is_end = {
                     let state = try_continue!(state_map.get_mut(&event.atom()));
                     let read_setmap = try_continue!(setmap.read().ok());
-                    let &(target, ref value) = try_continue!(read_setmap.get(&state.selection));
+                    let target_values_map = try_continue!(read_setmap.get(&state.selection));
+                    let value = try_continue!(target_values_map.get(&state.target));
 
                     let len = cmp::min(INCR_CHUNK_SIZE, value.len() - state.pos);
                     context.connection.send_request(&x::ChangeProperty {
                         mode: x::PropMode::Replace,
                         window: state.requestor,
                         property: state.property,
-                        r#type: target,
+                        r#type: state.target,
                         data: &value[state.pos..][..len],
                     });
 
