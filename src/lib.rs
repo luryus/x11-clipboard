@@ -148,7 +148,7 @@ impl Clipboard {
         Ok(Clipboard { getter, setter, setmap, send: sender })
     }
 
-    fn process_event<T>(&self, buff: &mut Vec<u8>, selection: Atom, target: Atom, property: Atom, timeout: T, use_xfixes: bool)
+    fn process_event<T>(&self, buff: &mut Vec<u8>, selection: Atom, target: Atom, property: Atom, timeout: T, use_xfixes: bool, sequence_number: u64)
         -> Result<(), Error>
         where T: Into<Option<Duration>>
     {
@@ -168,10 +168,10 @@ impl Clipboard {
                 return Err(Error::Timeout);
             }
 
-            let event = match use_xfixes {
-                true => self.getter.connection.wait_for_event()?,
+            let (event, seq) = match use_xfixes {
+                true => self.getter.connection.wait_for_event_with_sequence()?,
                 false => {
-                    match self.getter.connection.poll_for_event()? {
+                    match self.getter.connection.poll_for_event_with_sequence()? {
                         Some(event) => event,
                         None => {
                             thread::park_timeout(Duration::from_millis(POLL_DURATION));
@@ -180,6 +180,10 @@ impl Clipboard {
                     }
                 }
             };
+
+            if seq < sequence_number {
+                continue;
+            }
 
             match event {
                 Event::XfixesSelectionNotify(event) if use_xfixes => {
@@ -276,7 +280,7 @@ impl Clipboard {
         let mut buff = Vec::new();
         let timeout = timeout.into();
 
-        self.getter.connection.convert_selection(
+        let cookie = self.getter.connection.convert_selection(
             self.getter.window,
             selection,
             target,
@@ -285,9 +289,12 @@ impl Clipboard {
             // FIXME ^
             // Clients should not use CurrentTime for the time argument of a ConvertSelection request.
             // Instead, they should use the timestamp of the event that caused the request to be made.
-        )?.check()?;
+        )?;
 
-        self.process_event(&mut buff, selection, target, property, timeout, false)?;
+        let sequence_number = cookie.sequence_number();
+        cookie.check()?;
+
+        self.process_event(&mut buff, selection, target, property, timeout, false, sequence_number)?;
 
         self.getter.connection.delete_property(
             self.getter.window,
@@ -325,16 +332,19 @@ impl Clipboard {
             xfixes::SelectionEventMask::default()
         )?;
         // ...and set the one requested now
-        xfixes::select_selection_input(
+        let cookie = xfixes::select_selection_input(
             &self.getter.connection,
             screen.root,
             selection,
             xfixes::SelectionEventMask::SET_SELECTION_OWNER |
                 xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE |
                 xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
-        )?.check()?;
+        )?;
 
-        self.process_event(&mut buff, selection, target, property, None, true)?;
+        let sequence_number = cookie.sequence_number();
+        cookie.check()?;
+
+        self.process_event(&mut buff, selection, target, property, None, true, sequence_number)?;
 
         self.getter.connection.delete_property(self.getter.window, property)?.check()?;
 
